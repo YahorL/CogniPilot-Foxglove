@@ -12,7 +12,7 @@ ros2 launch foxglove_bridge foxglove_bridge_launch.xml &
 FOXGLOVE_BRIDGE_PID=$!
 
 # Start Foxglove Studio in the background
-foxglove-studio --url ws://localhost:8765 --layout ~/rdd2_fg_layout.json &
+foxglove-studio "foxglove://open?ds=foxglove-websocket&ds.url=ws://localhost:8765" &
 FOXGLOVE_PID=$!
 
 echo "All processes started:"
