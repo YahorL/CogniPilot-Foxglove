@@ -24,7 +24,7 @@ class OdometryDifferencePublisher(Node):
         super().__init__('odometry_difference_publisher')
         
         # Declare parameters
-        self.declare_parameter('odom_true', '/odom')
+        self.declare_parameter('odom_true', '/rdd2/odom')
         self.declare_parameter('odom_est', '/cerebri/out/odometry')
         self.declare_parameter('sync_tolerance', 0.1)  # seconds
         
@@ -37,7 +37,7 @@ class OdometryDifferencePublisher(Node):
         qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
             history=QoSHistoryPolicy.RMW_QOS_POLICY_HISTORY_KEEP_LAST,
-            depth=10
+            depth=20
         )
         
         # Create synchronized subscribers
@@ -48,13 +48,21 @@ class OdometryDifferencePublisher(Node):
             self, Odometry, self.odom_est, qos_profile=qos_profile
         )
         
-        # Synchronize messages
+        # Synchronize messages for difference calculations
         self.time_sync = message_filters.ApproximateTimeSynchronizer(
             [self.odom1_sub, self.odom2_sub], 
             queue_size=10, 
             slop=self.sync_tolerance
         )
         self.time_sync.registerCallback(self.synchronized_callback)
+        
+        # Create individual subscribers for independent euler angle publishing
+        self.odom1_individual_sub = self.create_subscription(
+            Odometry, self.odom_true, self.odom1_individual_callback, qos_profile
+        )
+        self.odom2_individual_sub = self.create_subscription(
+            Odometry, self.odom_est, self.odom2_individual_callback, qos_profile
+        )
         
         # Publishers for differences
         self.pos_diff_pub = self.create_publisher(
@@ -79,6 +87,9 @@ class OdometryDifferencePublisher(Node):
     
     def quaternion_to_euler_zyx(self, x: float, y: float, z: float, w: float) -> np.ndarray:
         """Convert quaternion to Euler angles (yaw-pitch-roll, ZYX order) in degrees.
+        
+        Note: This function returns [yaw, pitch, roll], but the published vectors
+        are reordered to [pitch, roll, yaw] for consistency with common conventions.
         
         Args:
             x: Quaternion x component
@@ -112,8 +123,124 @@ class OdometryDifferencePublisher(Node):
         """Wrap angle to [-180, 180] range in degrees."""
         return ((angle_deg + 180.0) % 360.0) - 180.0
     
+    def publish_differences(self, odom1_msg: Odometry, odom2_msg: Odometry, timestamp, frame_id: str) -> None:
+        """Compute and publish position and orientation differences between two odometry messages.
+        
+        Args:
+            odom1_msg: First odometry message (typically ground truth)
+            odom2_msg: Second odometry message (typically estimated)
+            timestamp: Reference timestamp for published messages
+            frame_id: Frame ID for published messages
+        """
+        # Extract positions
+        pos1 = np.array([
+            odom1_msg.pose.pose.position.x,
+            odom1_msg.pose.pose.position.y,
+            odom1_msg.pose.pose.position.z
+        ])
+        
+        pos2 = np.array([
+            odom2_msg.pose.pose.position.x,
+            odom2_msg.pose.pose.position.y,
+            odom2_msg.pose.pose.position.z
+        ])
+        
+        # Extract quaternions
+        quat1 = np.array([
+            odom1_msg.pose.pose.orientation.x,
+            odom1_msg.pose.pose.orientation.y,
+            odom1_msg.pose.pose.orientation.z,
+            odom1_msg.pose.pose.orientation.w
+        ])
+        
+        quat2 = np.array([
+            odom2_msg.pose.pose.orientation.x,
+            odom2_msg.pose.pose.orientation.y,
+            odom2_msg.pose.pose.orientation.z,
+            odom2_msg.pose.pose.orientation.w
+        ])
+        
+        # Compute position difference (topic1 - topic2)
+        pos_diff = pos1 - pos2
+        
+        # Compute orientation difference using quaternions
+        quat_diff = self.quaternion_difference(quat1, quat2)
+        euler_diff = self.quaternion_to_euler_zyx(quat_diff[0], quat_diff[1], quat_diff[2], quat_diff[3])
+        
+        # Wrap angles to [-180, 180] degrees
+        euler_diff = np.array([self.wrap_to_pi_degrees(angle) for angle in euler_diff])
+        
+        # Create and publish position difference
+        pos_diff_msg = Vector3Stamped()
+        pos_diff_msg.header = Header(stamp=timestamp, frame_id=frame_id)
+        pos_diff_msg.vector.x = float(pos_diff[0])
+        pos_diff_msg.vector.y = float(pos_diff[1])
+        pos_diff_msg.vector.z = float(pos_diff[2])
+        self.pos_diff_pub.publish(pos_diff_msg)
+        
+        # Create and publish orientation difference
+        ori_diff_msg = Vector3Stamped()
+        ori_diff_msg.header = Header(stamp=timestamp, frame_id=frame_id)
+        ori_diff_msg.vector.x = float(euler_diff[1])  # pitch difference
+        ori_diff_msg.vector.y = float(euler_diff[2])  # roll difference
+        ori_diff_msg.vector.z = float(euler_diff[0])  # yaw difference
+        self.ori_diff_pub.publish(ori_diff_msg)
+    
+    def publish_euler_angles(self, odom1_msg: Optional[Odometry], odom2_msg: Optional[Odometry], timestamp, frame_id: str) -> None:
+        """Convert quaternions to Euler angles and publish them separately.
+        
+        Args:
+            odom1_msg: First odometry message (typically ground truth), can be None
+            odom2_msg: Second odometry message (typically estimated), can be None
+            timestamp: Reference timestamp for published messages
+            frame_id: Frame ID for published messages
+        """
+        # Process first odometry message if available
+        if odom1_msg is not None:
+            # Extract quaternion
+            quat1 = np.array([
+                odom1_msg.pose.pose.orientation.x,
+                odom1_msg.pose.pose.orientation.y,
+                odom1_msg.pose.pose.orientation.z,
+                odom1_msg.pose.pose.orientation.w
+            ])
+            
+            # Convert quaternion to Euler angles
+            euler1 = self.quaternion_to_euler_zyx(quat1[0], quat1[1], quat1[2], quat1[3])
+            
+            # Create and publish Euler angles for topic1
+            euler1_msg = Vector3Stamped()
+            euler1_msg.header = Header(stamp=timestamp, frame_id=frame_id)
+            euler1_msg.vector.x = float(euler1[1])  # pitch
+            euler1_msg.vector.y = float(euler1[2])  # roll
+            euler1_msg.vector.z = float(euler1[0])  # yaw
+            self.euler1_pub.publish(euler1_msg)
+        
+        # Process second odometry message if available
+        if odom2_msg is not None:
+            # Extract quaternion
+            quat2 = np.array([
+                odom2_msg.pose.pose.orientation.x,
+                odom2_msg.pose.pose.orientation.y,
+                odom2_msg.pose.pose.orientation.z,
+                odom2_msg.pose.pose.orientation.w
+            ])
+            
+            # Convert quaternion to Euler angles
+            euler2 = self.quaternion_to_euler_zyx(quat2[0], quat2[1], quat2[2], quat2[3])
+            
+            # Create and publish Euler angles for topic2
+            euler2_msg = Vector3Stamped()
+            euler2_msg.header = Header(stamp=timestamp, frame_id=frame_id)
+            euler2_msg.vector.x = float(euler2[1])  # pitch
+            euler2_msg.vector.y = float(euler2[2])  # roll
+            euler2_msg.vector.z = float(euler2[0])  # yaw
+            self.euler2_pub.publish(euler2_msg)
+
     def synchronized_callback(self, odom1_msg: Odometry, odom2_msg: Odometry) -> None:
-        """Process synchronized odometry messages and publish differences.
+        """Process synchronized odometry messages and publish differences only.
+        
+        Note: Euler angle publishing is handled by individual callbacks to avoid redundancy.
         
         Args:
             odom1_msg: Odometry message from first topic (typically ground truth)
@@ -124,82 +251,30 @@ class OdometryDifferencePublisher(Node):
             timestamp = odom1_msg.header.stamp
             frame_id = odom1_msg.header.frame_id
             
-            # Extract positions
-            pos1 = np.array([
-                odom1_msg.pose.pose.position.x,
-                odom1_msg.pose.pose.position.y,
-                odom1_msg.pose.pose.position.z
-            ])
-            
-            pos2 = np.array([
-                odom2_msg.pose.pose.position.x,
-                odom2_msg.pose.pose.position.y,
-                odom2_msg.pose.pose.position.z
-            ])
-            
-            # Extract quaternions
-            quat1 = np.array([
-                odom1_msg.pose.pose.orientation.x,
-                odom1_msg.pose.pose.orientation.y,
-                odom1_msg.pose.pose.orientation.z,
-                odom1_msg.pose.pose.orientation.w
-            ])
-            
-            quat2 = np.array([
-                odom2_msg.pose.pose.orientation.x,
-                odom2_msg.pose.pose.orientation.y,
-                odom2_msg.pose.pose.orientation.z,
-                odom2_msg.pose.pose.orientation.w
-            ])
-            
-            # Compute position difference (topic1 - topic2)
-            pos_diff = pos1 - pos2
-            
-            # Compute orientation difference using quaternions
-            quat_diff = self.quaternion_difference(quat1, quat2)
-            euler_diff = self.quaternion_to_euler_zyx(quat_diff[0], quat_diff[1], quat_diff[2], quat_diff[3])
-            
-            # Wrap angles to [-180, 180] degrees
-            euler_diff = np.array([self.wrap_to_pi_degrees(angle) for angle in euler_diff])
-            
-            # Convert quaternions to Euler angles
-            euler1 = self.quaternion_to_euler_zyx(quat1[0], quat1[1], quat1[2], quat1[3])
-            euler2 = self.quaternion_to_euler_zyx(quat2[0], quat2[1], quat2[2], quat2[3])
-            
-            # Create and publish position difference
-            pos_diff_msg = Vector3Stamped()
-            pos_diff_msg.header = Header(stamp=timestamp, frame_id=frame_id)
-            pos_diff_msg.vector.x = float(pos_diff[0])
-            pos_diff_msg.vector.y = float(pos_diff[1])
-            pos_diff_msg.vector.z = float(pos_diff[2])
-            self.pos_diff_pub.publish(pos_diff_msg)
-            
-            # Create and publish orientation difference
-            ori_diff_msg = Vector3Stamped()
-            ori_diff_msg.header = Header(stamp=timestamp, frame_id=frame_id)
-            ori_diff_msg.vector.x = float(euler_diff[0])  # yaw difference
-            ori_diff_msg.vector.y = float(euler_diff[1])  # pitch difference
-            ori_diff_msg.vector.z = float(euler_diff[2])  # roll difference
-            self.ori_diff_pub.publish(ori_diff_msg)
-            
-            # Create and publish Euler angles for topic1
-            euler1_msg = Vector3Stamped()
-            euler1_msg.header = Header(stamp=timestamp, frame_id=frame_id)
-            euler1_msg.vector.x = float(euler1[0])  # yaw
-            euler1_msg.vector.y = float(euler1[1])  # pitch
-            euler1_msg.vector.z = float(euler1[2])  # roll
-            self.euler1_pub.publish(euler1_msg)
-            
-            # Create and publish Euler angles for topic2
-            euler2_msg = Vector3Stamped()
-            euler2_msg.header = Header(stamp=timestamp, frame_id=frame_id)
-            euler2_msg.vector.x = float(euler2[0])  # yaw
-            euler2_msg.vector.y = float(euler2[1])  # pitch
-            euler2_msg.vector.z = float(euler2[2])  # roll
-            self.euler2_pub.publish(euler2_msg)
+            # Publish differences between the two odometry topics
+            # (This requires both topics to be available)
+            self.publish_differences(odom1_msg, odom2_msg, timestamp, frame_id)
             
         except Exception as e:
             self.get_logger().error(f'Error processing odometry messages: {str(e)}')
+
+    def odom1_individual_callback(self, msg: Odometry) -> None:
+        """Callback for the first individual odometry subscriber."""
+        try:
+            timestamp = msg.header.stamp
+            frame_id = msg.header.frame_id
+            self.publish_euler_angles(msg, None, timestamp, frame_id) # Pass None for odom2_msg
+        except Exception as e:
+            self.get_logger().error(f'Error processing individual odom1 message: {str(e)}')
+
+    def odom2_individual_callback(self, msg: Odometry) -> None:
+        """Callback for the second individual odometry subscriber."""
+        try:
+            timestamp = msg.header.stamp
+            frame_id = msg.header.frame_id
+            self.publish_euler_angles(None, msg, timestamp, frame_id) # Pass None for odom1_msg
+        except Exception as e:
+            self.get_logger().error(f'Error processing individual odom2 message: {str(e)}')
 
 def main(args: Optional[list] = None) -> None:
     """Main function to run the odometry difference publisher node.
